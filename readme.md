@@ -2,7 +2,7 @@
 
 Recursive **directory fuzzer + file downloader** with progress bars.  
 It fuzzes directories using a wordlist (recursively), crawls discovered pages,
-and downloads files that match extensions from your list — respecting `robots.txt`.
+and downloads files that match extensions from your list.
 
 > **Use responsibly.** Only scan targets you own or have explicit permission to test.
 
@@ -29,3 +29,9 @@ Install:
 python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+
+python3 sitesifter.py -h
+<img width="1283" height="333" alt="image" src="https://github.com/user-attachments/assets/a24e4eac-8102-40b5-a138-ed5ae9eb93ed" />
+
+python3 sitesifter.py -u http://example.com -d /home/kali/SiteSifter
+<img width="1902" height="187" alt="image" src="https://github.com/user-attachments/assets/fde1d232-1289-44a6-9342-4ad6c6fd05b0" />
