@@ -8,8 +8,8 @@ import random
 import re
 import sys
 import time
-from threading import Lock, Thread
 from collections import deque
+from threading import Lock, Thread
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, urldefrag
 
@@ -18,20 +18,33 @@ from bs4 import BeautifulSoup
 from tqdm import tqdm
 from urllib.robotparser import RobotFileParser
 
-UA = "SiteSifter/2.0 (+https://example.local)"
+UA = "SiteSifter/2.1 (+https://example.local)"
 OK = {200, 301, 302, 303, 307, 308, 401, 403}
 CHUNK = 64 * 1024
 
-TQDM_KW = dict(dynamic_ncols=True, mininterval=0.1, miniters=1, leave=False, file=sys.stdout)
+DIR_DEPTH = 1
+CRAWL_DEPTH = 1
+DEFAULT_OUT_DIR = "downloads"
 
 MAX_FILE_PROBES = 200_000
 
+TQDM_KW = dict(
+    dynamic_ncols=True,
+    mininterval=0.1,
+    miniters=1,
+    leave=False,
+    file=sys.stdout,
+)
 
 
 def require_file(cli_value: str | None, fallback: str, purpose: str) -> Path:
     path = Path(cli_value) if cli_value else Path(fallback)
     if not path.exists():
-        print(f"[!] Missing {purpose} file: '{path}'. Provide it via flag or create '{fallback}' in CWD.", file=sys.stderr)
+        print(
+            f"[!] Missing {purpose} file: '{path}'. "
+            f"Provide it via flag or create '{fallback}' in CWD.",
+            file=sys.stderr,
+        )
         sys.exit(2)
     return path
 
@@ -75,7 +88,11 @@ def allowed(rp: RobotFileParser | None, url: str) -> bool:
         return True
 
 
-def head_or_get(session: requests.Session, url: str, timeout: int) -> requests.Response | None:
+def head_or_get(
+    session: requests.Session,
+    url: str,
+    timeout: int,
+) -> requests.Response | None:
     try:
         r = session.head(url, allow_redirects=True, timeout=timeout)
     except Exception:
@@ -98,7 +115,6 @@ def is_dirlike(resp: requests.Response, final_url: str) -> bool:
     return False
 
 
-
 def _soft404_signature(resp: requests.Response) -> tuple[int, bool, int, int]:
     status = resp.status_code
     ctype = (resp.headers.get("Content-Type") or "").lower()
@@ -109,11 +125,22 @@ def _soft404_signature(resp: requests.Response) -> tuple[int, bool, int, int]:
         body = ""
     length_bucket = len(body) // 128
     txt = body.lower()
-    kw_flag = 1 if any(k in txt for k in ("404", "not found", "page not found", "nie znaleziono", "strona nie", "страница не найдена", "не найдено")) else 0
+    kw_flag = 1 if any(
+        k in txt
+        for k in (
+            "404", "not found", "page not found",
+            "nie znaleziono", "strona nie",
+            "страница не найдена", "не найдено",
+        )
+    ) else 0
     return (status, is_html, length_bucket, kw_flag)
 
 
-def build_soft404_detector(session: requests.Session, base: str, timeout: int):
+def build_soft404_detector(
+    session: requests.Session,
+    base: str,
+    timeout: int,
+):
     base_slash = base.rstrip("/") + "/"
     samples = []
     for _ in range(3):
@@ -140,8 +167,13 @@ def local_path(dest: Path, base_netloc: str, file_url: str) -> Path:
     return full
 
 
-def download_one(session: requests.Session, url: str, out_path: Path, timeout: int) -> tuple[str, bool, str]:
-    """Download a single URL. Save whatever content the server returns (even HTML)."""
+def download_one(
+    session: requests.Session,
+    url: str,
+    out_path: Path,
+    timeout: int,
+) -> tuple[str, bool, str]:
+    """Сохраняем любой контент, который отдаёт сервер (включая HTML)."""
     try:
         if out_path.exists():
             return url, False, "exists"
@@ -159,18 +191,35 @@ def download_one(session: requests.Session, url: str, out_path: Path, timeout: i
 
 
 class LiveDownloader:
-    """Threaded downloader with a dynamic tqdm total."""
-    def __init__(self, session: requests.Session, dest: Path, base_netloc: str, timeout: int, workers: int):
+    """Threaded downloader with dynamic tqdm total and quiet skip logging."""
+    STATUS_TICK_SEC = 5
+    SAMPLE_SKIPS_PER_REASON = 2
+
+    def __init__(
+        self,
+        session: requests.Session,
+        dest: Path,
+        base_netloc: str,
+        timeout: int,
+        workers: int,
+    ):
         self.session = session
         self.dest = dest
         self.base_netloc = base_netloc
         self.timeout = timeout
+
         self.q: queue.Queue[str | None] = queue.Queue()
         self.pbar = tqdm(total=0, desc="Download", unit="file", **TQDM_KW)
+
         self.ok = 0
         self.skip = 0
-        self.err = 0
-        self.lock = Lock()
+
+        self._skip_reasons: dict[str, int] = {}
+        self._skip_examples: dict[str, list[str]] = {}
+
+        self._lock = Lock()
+        self._last_tick = time.time()
+
         self.workers: list[Thread] = []
         for _ in range(max(1, workers)):
             t = Thread(target=self._worker, daemon=True)
@@ -178,11 +227,33 @@ class LiveDownloader:
             self.workers.append(t)
 
     def enqueue(self, url: str):
-        # Increase total dynamically
-        with self.lock:
+        with self._lock:
             self.pbar.total += 1
             self.pbar.refresh()
         self.q.put(url)
+
+    def _note_skip(self, reason: str, url: str):
+        self._skip_reasons[reason] = self._skip_reasons.get(reason, 0) + 1
+        lst = self._skip_examples.setdefault(reason, [])
+        if len(lst) < self.SAMPLE_SKIPS_PER_REASON:
+            lst.append(url)
+
+    def _maybe_status(self):
+        if self.STATUS_TICK_SEC <= 0:
+            return
+        now = time.time()
+        if now - self._last_tick >= self.STATUS_TICK_SEC:
+            self._last_tick = now
+            top = sorted(
+                self._skip_reasons.items(),
+                key=lambda kv: -kv[1],
+            )[:3]
+            parts = [f"ok={self.ok}", f"skip={self.skip}"]
+            if top:
+                parts.append(
+                    "reasons=[" + ", ".join(f"{k}:{v}" for k, v in top) + "]"
+                )
+            tqdm.write("[status] " + " ".join(parts))
 
     def _worker(self):
         while True:
@@ -192,13 +263,14 @@ class LiveDownloader:
                 break
             outp = local_path(self.dest, self.base_netloc, url)
             u, good, msg = download_one(self.session, url, outp, self.timeout)
-            with self.lock:
+            with self._lock:
                 self.pbar.update(1)
                 if good:
                     self.ok += 1
                 else:
                     self.skip += 1
-                    tqdm.write(f"[-] SKIP  {u} ({msg})")
+                    self._note_skip(msg, u)
+                self._maybe_status()
             self.q.task_done()
 
     def finish(self):
@@ -209,6 +281,15 @@ class LiveDownloader:
             t.join()
         self.pbar.close()
 
+        if self._skip_reasons:
+            tqdm.write("[i] Skip breakdown:")
+            for reason, cnt in sorted(
+                self._skip_reasons.items(),
+                key=lambda kv: -kv[1],
+            ):
+                examples = self._skip_examples.get(reason) or []
+                tail = f" e.g. {', '.join(examples)}" if examples else ""
+                tqdm.write(f"    - {reason}: {cnt}{tail}")
 
 
 def extract_links(html: str, base_url: str) -> list[str]:
@@ -224,8 +305,13 @@ def extract_links(html: str, base_url: str) -> list[str]:
     return out
 
 
-def scan_dir_for_files(dir_url: str, session: requests.Session, exts: set[str], rp: RobotFileParser | None, timeout: int) -> list[str]:
-    """Parse one directory page and return links to files with required extensions (same host)."""
+def scan_dir_for_files(
+    dir_url: str,
+    session: requests.Session,
+    exts: set[str],
+    rp: RobotFileParser | None,
+    timeout: int,
+) -> list[str]:
     if not allowed(rp, dir_url):
         return []
     try:
@@ -248,8 +334,14 @@ def scan_dir_for_files(dir_url: str, session: requests.Session, exts: set[str], 
     return hits
 
 
-def collect_files(start_dirs: set[str], session: requests.Session, exts: set[str], rp: RobotFileParser | None, timeout: int, depth: int) -> list[str]:
-    """Crawl multiple levels of HTML pages starting from given directories."""
+def collect_files(
+    start_dirs: set[str],
+    session: requests.Session,
+    exts: set[str],
+    rp: RobotFileParser | None,
+    timeout: int,
+    depth: int,
+) -> list[str]:
     seen_html: set[str] = set()
     files: list[str] = []
     level: list[str] = list(start_dirs)
@@ -304,8 +396,16 @@ def collect_files(start_dirs: set[str], session: requests.Session, exts: set[str
     return out
 
 
-def fuzz_files_from_words(dirs: set[str], words: list[str], exts: set[str], session: requests.Session, rp: RobotFileParser | None, timeout: int, concurrency: int, max_probes: int) -> list[str]:
-    """Try <dir>/<word>.<ext> under each dir (capped)."""
+def fuzz_files_from_words(
+    dirs: set[str],
+    words: list[str],
+    exts: set[str],
+    session: requests.Session,
+    rp: RobotFileParser | None,
+    timeout: int,
+    concurrency: int,
+    max_probes: int,
+) -> list[str]:
     if not max_probes:
         return []
     dirs_list = list(dirs)
@@ -331,7 +431,7 @@ def fuzz_files_from_words(dirs: set[str], words: list[str], exts: set[str], sess
         r = head_or_get(session, u, timeout)
         if not r or r.status_code != 200:
             return None
-        return r.url  # do not second-guess content-type
+        return r.url
 
     found: list[str] = []
     with tqdm(total=total, desc="Fuzz files (word×ext)", unit="probe", **TQDM_KW) as pbar:
@@ -366,18 +466,25 @@ def fuzz_files_from_words(dirs: set[str], words: list[str], exts: set[str], sess
     return out
 
 
-def fuzz_dirs_recursive(base: str, words: list[str], session: requests.Session, rp: RobotFileParser | None, timeout: int, concurrency: int, depth: int, is_soft404, exts: set[str], enqueue_file) -> set[str]:
-    """
-    Recursively fuzz directories using the wordlist (BFS).
-    Print dirs as soon as found AND immediately enqueue files from the directory page.
-    """
+
+def fuzz_dirs_recursive(
+    base: str,
+    words: list[str],
+    session: requests.Session,
+    rp: RobotFileParser | None,
+    timeout: int,
+    concurrency: int,
+    depth: int,
+    is_soft404,
+    exts: set[str],
+    enqueue_file,
+) -> set[str]:
     base = base.rstrip("/") + "/"
     discovered: set[str] = {base}
     seen_parents: set[str] = set()
     q: deque[tuple[str, int]] = deque([(base, 0)])
 
     tqdm.write(f"[+] dir: {base}")
-    # Immediate scan of root page
     for f in scan_dir_for_files(base, session, exts, rp, timeout):
         enqueue_file(f)
 
@@ -415,7 +522,8 @@ def fuzz_dirs_recursive(base: str, words: list[str], session: requests.Session, 
                 cand.add(urljoin(parent_slash, w + "/"))
 
             pbar.total += len(cand)
-            pbar.set_postfix(level=level, dirs=len(discovered), queued=len(q) + len(cand))
+            pbar.set_postfix(level=level, dirs=len(discovered),
+                             queued=len(q) + len(cand))
             pbar.refresh()
 
             with cf.ThreadPoolExecutor(max_workers=concurrency) as ex:
@@ -426,8 +534,9 @@ def fuzz_dirs_recursive(base: str, words: list[str], session: requests.Session, 
                     if found and found not in discovered:
                         discovered.add(found)
                         tqdm.write(f"[+] dir: {found}")
-                        # immediate scan of that directory page and enqueue files
-                        for file_url in scan_dir_for_files(found, session, exts, rp, timeout):
+                        for file_url in scan_dir_for_files(
+                            found, session, exts, rp, timeout
+                        ):
                             enqueue_file(file_url)
                         if level < depth:
                             q.append((found, level + 1))
@@ -437,26 +546,43 @@ def fuzz_dirs_recursive(base: str, words: list[str], session: requests.Session, 
     return discovered
 
 
+# ---------- CLI ----------
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Recursive dir fuzzer + live downloader (HTML crawl + word×ext brute).",
+        description="Recursive dir fuzzer + live downloader (quiet skips).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("-u", "--url", required=True, help="Base host/URL (schema optional, e.g., example.com).")
-    parser.add_argument("-d", "--dest", required=True, help="Directory to save downloaded files.")
-    parser.add_argument("-w", "--wordlist", help="Wordlist file (one path per line). If omitted, ./wordlist.txt is used.")
-    parser.add_argument("-e", "--ext-file", help="Extensions file (one per line, without a dot). If omitted, ./extensions.txt is used.")
-    parser.add_argument("-c", "--concurrency", type=int, default=16, help="Number of threads.")
-    parser.add_argument("--timeout", type=int, default=12, help="HTTP timeout in seconds.")
-    parser.add_argument("--dir-depth", type=int, default=1, help="Depth for recursive directory fuzzing via wordlist.")
-    parser.add_argument("--crawl-depth", type=int, default=1, help="HTML crawl depth (0 = only dir page; 1 = one level).")
-    parser.add_argument("--depth", type=int, dest="crawl_depth", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "-u", "--url", required=True,
+        help="Base host/URL (schema optional, e.g., example.com).",
+    )
+    parser.add_argument(
+        "-d", "--dest",
+        help=f"Directory to save files (default: ./{DEFAULT_OUT_DIR}/<host>).",
+    )
+    parser.add_argument(
+        "-w", "--wordlist",
+        help="Wordlist file (one path per line). If omitted, ./wordlist.txt is used.",
+    )
+    parser.add_argument(
+        "-e", "--ext-file",
+        help="Extensions file (one per line, without a dot). If omitted, ./extensions.txt is used.",
+    )
+    parser.add_argument(
+        "-c", "--concurrency", type=int, default=16,
+        help="Number of threads.",
+    )
+    parser.add_argument(
+        "--timeout", type=int, default=12,
+        help="HTTP timeout in seconds.",
+    )
 
     args = parser.parse_args()
 
     base = normalize_base(args.url)
-    dest = Path(args.dest).resolve()
+    host = urlparse(base).netloc
+    dest = Path(args.dest).resolve() if args.dest else (Path(DEFAULT_OUT_DIR) / host).resolve()
     dest.mkdir(parents=True, exist_ok=True)
 
     wordlist_path = require_file(args.wordlist, "wordlist.txt", "wordlist")
@@ -472,12 +598,20 @@ def main() -> None:
     print(f"[i] Output directory: {dest}")
     print(f"[i] Wordlist: {wordlist_path} ({len(wordlist)} entries)")
     print(f"[i] Extensions: {exts_path} ({', '.join(sorted(exts))})")
-    print("[i] robots.txt:", "will be respected" if rp else "not found or unreadable")
+    print(
+        "[i] robots.txt:",
+        "will be respected" if rp else "not found or unreadable",
+    )
 
     is_soft404 = build_soft404_detector(session, base, args.timeout)
 
-    base_netloc = urlparse(base).netloc
-    dloader = LiveDownloader(session=session, dest=dest, base_netloc=base_netloc, timeout=args.timeout, workers=args.concurrency)
+    dloader = LiveDownloader(
+        session=session,
+        dest=dest,
+        base_netloc=host,
+        timeout=args.timeout,
+        workers=args.concurrency,
+    )
 
     seen_files: set[str] = set()
     seen_lock = Lock()
@@ -499,26 +633,44 @@ def main() -> None:
         rp=rp,
         timeout=args.timeout,
         concurrency=args.concurrency,
-        depth=args.dir_depth,
+        depth=DIR_DEPTH,
         is_soft404=is_soft404,
         exts=exts,
         enqueue_file=enqueue_file,
     )
 
     print(f"[i] Discovered directories (recursive): {len(all_dirs)}")
-
-    crawl_hits = collect_files(start_dirs=all_dirs, session=session, exts=exts, rp=rp, timeout=args.timeout, depth=args.crawl_depth)
+    crawl_hits = collect_files(
+        start_dirs=all_dirs,
+        session=session,
+        exts=exts,
+        rp=rp,
+        timeout=args.timeout,
+        depth=CRAWL_DEPTH,
+    )
     for u in crawl_hits:
         enqueue_file(u)
 
-    brute_hits = fuzz_files_from_words(dirs=all_dirs, words=wordlist, exts=exts, session=session, rp=rp, timeout=args.timeout, concurrency=args.concurrency, max_probes=MAX_FILE_PROBES)
+    brute_hits = fuzz_files_from_words(
+        dirs=all_dirs,
+        words=wordlist,
+        exts=exts,
+        session=session,
+        rp=rp,
+        timeout=args.timeout,
+        concurrency=args.concurrency,
+        max_probes=MAX_FILE_PROBES,
+    )
     for u in brute_hits:
         enqueue_file(u)
 
     dloader.finish()
 
     dt = time.time() - t0
-    print(f"[✓] Done. Success: {dloader.ok}, skipped/errors: {dloader.skip}, elapsed: {dt:.1f}s")
+    print(
+        f"[✓] Done. Success: {dloader.ok}, skipped/errors: {dloader.skip}, "
+        f"elapsed: {dt:.1f}s"
+    )
     print(f"[→] Files saved under: {dest}")
 
 
