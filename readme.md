@@ -33,8 +33,30 @@ pip install -r requirements.txt
 Help:
 ```
 python3 sitesifter.py -h
+
+└─$ python3 sitesifter.py -h
+usage: sitesifter.py [-h] -u URL -d DEST [-w WORDLIST] [-e EXT_FILE] [-c CONCURRENCY] [--timeout TIMEOUT] [--dir-depth DIR_DEPTH] [--crawl-depth CRAWL_DEPTH]
+
+Recursive dir fuzzer + live downloader (HTML crawl + word×ext brute).
+
+options:
+  -h, --help            show this help message and exit
+  -u, --url URL         Base host/URL (schema optional, e.g., example.com). (default: None)
+  -d, --dest DEST       Directory to save downloaded files. (default: None)
+  -w, --wordlist WORDLIST
+                        Wordlist file (one path per line). If omitted, ./wordlist.txt is used. (default: None)
+  -e, --ext-file EXT_FILE
+                        Extensions file (one per line, without a dot). If omitted, ./extensions.txt is used. (default: None)
+  -c, --concurrency CONCURRENCY
+                        Number of threads. (default: 16)
+  --timeout TIMEOUT     HTTP timeout in seconds. (default: 12)
+  --dir-depth DIR_DEPTH
+                        Depth for recursive directory fuzzing via wordlist. (default: 1)
+  --crawl-depth CRAWL_DEPTH
+                        HTML crawl depth (0 = only dir page; 1 = one level). (default: 1)
 ```
-<img width="1300" height="338" alt="image" src="https://github.com/user-attachments/assets/45707957-a76f-44c2-bf09-c7da74c54e1c" />
+<img width="1285" height="333" alt="image" src="https://github.com/user-attachments/assets/a1a439f8-cf37-4bb7-8c49-69e03764f98d" />
+
 
 Usage (full)
 ```
